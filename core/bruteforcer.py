@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import re
 import sys
 import time
@@ -39,7 +38,8 @@ class RateLimitDetector:
                 self._paused = True
                 return "pause"
 
-            if count_403 >= self.SUSPECT_THRESHOLD_403:
+
+            if not self._paused and count_403 >= self.SUSPECT_THRESHOLD_403:
                 new_delay = max(self._current_delay * 2, 1.0)
                 if new_delay != self._current_delay:
                     self._current_delay = new_delay
@@ -246,7 +246,6 @@ def bruteforce(base_url, paths, threads=10, timeout=5, headers=None, delay=0,
     return results
 
 
-
 WAF_SIGNATURES = {
     "Cloudflare": {
         "headers": ["cf-ray", "cf-cache-status", "cf-request-id"],
@@ -370,7 +369,7 @@ def test_http_methods(url, timeout=5, headers=None):
     return results
 
 
-_VERSION_RE = re.compile(r'/v(\d+(?:\.\d+)?)/') 
+_VERSION_RE = re.compile(r'/v(\d+(?:\.\d+)?)/')
 
 VERSION_VARIANTS = [
     "v1", "v2", "v3", "v4", "v5",

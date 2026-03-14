@@ -1,9 +1,7 @@
-#!/usr/bin/env python3
-
 import sys
 from colorama import init, Fore, Style
 
-if hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding != 'utf-8':
+if hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding is not None and sys.stdout.encoding.lower() != 'utf-8':
     try:
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:

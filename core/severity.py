@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import re
 
 
@@ -71,7 +70,7 @@ def score_endpoint(result):
     reasons = []
 
 
-    severity = INFO  # default
+    severity = INFO
 
     for tier_sev, keywords in KEYWORD_TIERS:
         kw = _match_keywords(path, keywords)
@@ -87,7 +86,6 @@ def score_endpoint(result):
         elif status == 403:
             reasons.append("Status 403: exists but forbidden")
         elif status == 500:
-            # Bump severity up one level
             idx = SEVERITY_ORDER.index(severity)
             if idx > 0:
                 severity = SEVERITY_ORDER[idx - 1]

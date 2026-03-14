@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 
 import argparse
 import base64
@@ -11,10 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse
 
-# Ensure imports work regardless of working directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Suppress SSL warnings globally
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -44,7 +42,6 @@ from core.bruteforcer import (
 )
 from core.severity import score_endpoint, sort_by_severity, get_severity_stats, SEVERITY_ORDER
 
-# Optional imports — gracefully degrade if missing
 try:
     from core.cors_scanner import scan_cors_bulk
     HAS_CORS_SCANNER = True
@@ -129,27 +126,15 @@ def parse_args():
     return parser.parse_args()
 
 def build_auth_headers(args):
-    """
-    Build a headers dict from the parsed authentication CLI flags.
-
-    Supports:
-    - Bearer token
-    - Basic auth (base64 encoded)
-    - Raw cookie header
-    - Custom header injection via --header
-    """
     auth_headers = {}
 
-    # --cookie flag
     if args.cookie:
         auth_headers["Cookie"] = args.cookie
 
-    # --auth-type + --auth-token
     if args.auth_type and args.auth_token:
         if args.auth_type == "bearer":
             auth_headers["Authorization"] = f"Bearer {args.auth_token}"
         elif args.auth_type == "basic":
-            # Expect auth_token as "user:pass"
             try:
                 encoded = base64.b64encode(args.auth_token.encode("utf-8")).decode("utf-8")
                 auth_headers["Authorization"] = f"Basic {encoded}"
@@ -158,12 +143,10 @@ def build_auth_headers(args):
         elif args.auth_type == "cookie":
             auth_headers["Cookie"] = args.auth_token
         elif args.auth_type == "custom":
-            # Expect auth_token as "Header-Name: value"
             if ":" in args.auth_token:
                 key, _, val = args.auth_token.partition(":")
                 auth_headers[key.strip()] = val.strip()
 
-    # --header flags (repeatable)
     if args.extra_headers:
         for h in args.extra_headers:
             if ":" in h:
@@ -174,13 +157,11 @@ def build_auth_headers(args):
 
 
 def validate_url(url):
-    """Validate and normalize the target URL."""
     if not url:
         return None
 
     url = url.strip().rstrip("/")
 
-    # Auto-add scheme if missing
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
 
@@ -194,17 +175,14 @@ def validate_url(url):
 
 
 def get_default_wordlist():
-    """Return absolute path to the built-in wordlist."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "wordlists", "api_paths.txt")
 
 
 def build_url(base_url, path):
-    """Safely concatenate base URL and path, avoiding double slashes."""
     return base_url.rstrip("/") + ("/" + path.lstrip("/") if not path.startswith("/") else path)
 
 
 def _verify_path(target_url, r, timeout, headers, allowed_codes, baseline):
-    """Verify a single discovered path. Module-level helper for Phase 4."""
     try:
         cr = check_path(target_url, r["path"], timeout, headers, 0, baseline)
         r["status"] = cr["status"]
@@ -216,10 +194,6 @@ def _verify_path(target_url, r, timeout, headers, allowed_codes, baseline):
         return False
 
 def save_progress(checked_paths, found_results, output_name, target_url):
-    """
-    Save scan progress to {output_name}.progress.json.
-    Called periodically so scans can be resumed after interruption.
-    """
     progress_file = f"{output_name}.progress.json"
     data = {
         "target_url": target_url,
@@ -235,10 +209,6 @@ def save_progress(checked_paths, found_results, output_name, target_url):
 
 
 def load_progress(output_name, target_url):
-    """
-    Load progress file if it exists and the target URL matches.
-    Returns (checked_paths_set, partial_results_list) or (set(), []).
-    """
     progress_file = f"{output_name}.progress.json"
 
     if not os.path.exists(progress_file):
@@ -248,7 +218,6 @@ def load_progress(output_name, target_url):
         with open(progress_file, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        # Validate target URL matches
         if data.get("target_url") != target_url:
             return set(), []
 
@@ -261,7 +230,6 @@ def load_progress(output_name, target_url):
 
 
 def delete_progress(output_name):
-    """Delete the progress file after scan completes."""
     progress_file = f"{output_name}.progress.json"
     try:
         if os.path.exists(progress_file):
@@ -270,14 +238,12 @@ def delete_progress(output_name):
         pass
 
 def _redact_secret(value):
-    """Redact a secret value: show first 4 and last 4 chars, mask the middle."""
     if not value or len(value) <= 12:
         return "****"
     return value[:4] + "*" * min(len(value) - 8, 20) + value[-4:]
 
 
 def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_findings=None, jwt_findings=None):
-    """Save results to .txt, .json, and .md report files."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     txt_path = f"{output_name}.txt"
@@ -364,7 +330,6 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
         f.write(f"| **Duration** | {elapsed:.1f}s |\n")
         f.write(f"| **Total Endpoints** | {stats.get('total', 0)} |\n\n")
 
-        # Severity summary table
         f.write("## Severity Summary\n\n")
         f.write("| Severity | Count |\n")
         f.write("|----------|-------|\n")
@@ -374,7 +339,6 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
             f.write(f"| {emoji} **{sev}** | {count} |\n")
         f.write(f"| **TOTAL** | **{stats.get('total', 0)}** |\n\n")
 
-        # Each severity group
         for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
             sev_results = [r for r in results if r.get("severity") == sev]
             if not sev_results:
@@ -391,7 +355,6 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
                 f.write(f"| `{path}` | {status} | {source} | {reason} |\n")
             f.write("\n")
 
-        # Secrets section with redacted values
         if secrets:
             f.write("## Secrets Found\n\n")
             f.write("| Type | Value (Redacted) | File |\n")
@@ -404,7 +367,6 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
                 f.write(f"| {stype} | `{redacted}` | {sfile} |\n")
             f.write("\n")
 
-        # CORS findings
         if cors_findings:
             f.write("## CORS Misconfigurations\n\n")
             f.write("| URL | Severity | Description |\n")
@@ -416,7 +378,6 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
                 f.write(f"| `{curl}` | {csev} | {cdesc} |\n")
             f.write("\n")
 
-        # JWT findings
         if jwt_findings:
             f.write("## JWT Vulnerabilities\n\n")
             for jf in jwt_findings:
@@ -508,6 +469,7 @@ def main():
             discovered_paths.update(resumed_paths)
         else:
             print_info("No progress file found — starting fresh scan")
+
     if not args.no_robots:
         print_section("PHASE 1 — ROBOTS.TXT & SITEMAP.XML")
 
@@ -596,13 +558,12 @@ def main():
 
             print_success(f"JS scan complete — {js_paths_count} paths, {js_secrets_count} secrets found")
 
-            # Display discovered secrets with warnings
             if all_secrets:
                 print()
                 for s in all_secrets:
                     fname = s.get("file", "unknown")
                     fname = fname.split("/")[-1] if "/" in fname else fname
-                    fname = fname.split("?")[0]  # remove query string
+                    fname = fname.split("?")[0]
                     print_warn(f"SECRET FOUND in {fname}")
                     print(f"            Type  : {s.get('type', 'Unknown')}")
                     val = s.get("value", "N/A")
@@ -643,13 +604,11 @@ def main():
             wl_paths = load_wordlist(wl_path)
             original_count = len(wl_paths)
 
-            # Remove paths already discovered in Phases 1 & 2
             wl_paths = [p for p in wl_paths if p not in discovered_paths]
             removed = original_count - len(wl_paths)
             if removed:
                 print_info(f"Skipped {removed} already-discovered paths (no duplicates)")
 
-            # Resume: skip already-checked paths
             if resumed_paths:
                 before = len(wl_paths)
                 wl_paths = [p for p in wl_paths if p not in resumed_paths]
@@ -660,11 +619,71 @@ def main():
             print_info(f"Bruteforcing {len(wl_paths)} paths with {args.threads} threads...")
             print()
 
-            _progress_count = [0]
-            _brute_checked = set(resumed_paths)
+
+            import threading
+            _actual_checked = set(resumed_paths)
+            _checked_lock = threading.Lock()
+
+            original_bruteforce = bruteforce
+
+            def bruteforce_with_tracking(base_url, paths, **kwargs):
+                """Thin wrapper that records dispatched paths for accurate resume."""
+                from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+                from core.bruteforcer import check_path, _ProgressCounter, RateLimitDetector
+                from core.display import print_progress as _pp, print_warn as _pw, print_info as _pi
+                import time as _time
+
+                allowed = kwargs.get("allowed_status_codes", [200, 201, 301, 302, 403, 405, 500])
+                timeout = kwargs.get("timeout", 5)
+                delay = kwargs.get("delay", 0)
+                threads = kwargs.get("threads", 10)
+                hdrs = kwargs.get("headers")
+                bl = kwargs.get("baseline")
+                results = []
+                total = len(paths)
+                counter = _ProgressCounter()
+                rate_detector = RateLimitDetector(base_delay=delay)
+
+                def _worker(path):
+                    with _checked_lock:
+                        _actual_checked.add(path)
+                    current_delay = rate_detector.current_delay
+                    r = check_path(base_url, path, timeout, hdrs, current_delay, bl)
+                    current = counter.increment()
+                    suggestion = rate_detector.record(r["status"])
+                    if suggestion == "pause":
+                        _pw("\n  [RATE LIMIT] 429 responses detected — pausing 30s...")
+                        _time.sleep(30)
+                        rate_detector.clear_pause()
+                        _pi("  Resuming scan...")
+                    elif isinstance(suggestion, (int, float)):
+                        _pw(f"\n  [RATE LIMIT] Suspicious 403 pattern — delay increased to {suggestion:.1f}s")
+                    if current % 5 == 0 or current == total:
+                        _pp(current, total, prefix="Bruteforcing")
+                    return r
+
+                with ThreadPoolExecutor(max_workers=threads) as executor:
+                    futures = {executor.submit(_worker, p): p for p in paths}
+                    try:
+                        for future in _as_completed(futures):
+                            try:
+                                r = future.result()
+                                if r["status"] in allowed:
+                                    results.append(r)
+                            except Exception:
+                                pass
+                    except KeyboardInterrupt:
+                        import sys as _sys
+                        _sys.stdout.write("\n")
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        _pp(total, total, prefix="Bruteforcing")
+                        raise
+
+                _pp(total, total, prefix="Bruteforcing")
+                return results
 
             try:
-                brute_results = bruteforce(
+                brute_results = bruteforce_with_tracking(
                     target_url,
                     wl_paths,
                     threads=args.threads,
@@ -676,8 +695,7 @@ def main():
                 )
             except KeyboardInterrupt:
                 print_warn("Brute-force interrupted — saving progress...")
-                _brute_checked.update(wl_paths)  # Mark all as checked
-                save_progress(list(_brute_checked), all_results, args.output, target_url)
+                save_progress(list(_actual_checked), all_results, args.output, target_url)
                 print_success(f"Progress saved to {args.output}.progress.json")
                 raise
 
@@ -696,7 +714,6 @@ def main():
                 versioned = generate_versioned_paths(found_paths)
 
                 if versioned:
-                    # Remove already discovered
                     versioned = [p for p in versioned if p not in discovered_paths]
                     if versioned:
                         print_info(f"Testing {len(versioned)} version variants...")
@@ -745,10 +762,8 @@ def main():
 
         print_success(f"Verified — {verified_count} paths returned allowed status codes")
 
-    # Filter to only allowed status codes
     all_results = [r for r in all_results if isinstance(r.get("status"), int) and r["status"] in allowed_codes]
 
-    # De-duplicate by path
     seen_paths = set()
     unique_results = []
     for r in all_results:
@@ -789,33 +804,28 @@ def main():
 
     print_section("SEVERITY SCORING & RESULTS")
 
-    # Score every result
     scored = [score_endpoint(r) for r in all_results]
     scored = sort_by_severity(scored)
     stats = get_severity_stats(scored)
 
-    # Summary table
     print_severity_summary(stats)
 
-    # Determine which severity levels to show in detail
     if args.show_all:
         detail_sevs = list(SEVERITY_ORDER)
     else:
         try:
             cutoff = SEVERITY_ORDER.index(args.min_severity) + 1
         except ValueError:
-            cutoff = 2  # default HIGH
+            cutoff = 2
         detail_sevs = SEVERITY_ORDER[:cutoff]
 
     summary_sevs = [s for s in SEVERITY_ORDER if s not in detail_sevs]
 
-    # Detailed output for selected severities
     for sev in detail_sevs:
         sev_results = [r for r in scored if r.get("severity") == sev]
         if sev_results:
             print_severity_group(sev, sev_results)
 
-    # Count-only output for remaining severities
     for sev in summary_sevs:
         count = stats.get(sev, 0)
         if count > 0:
@@ -853,12 +863,11 @@ def main():
             print_section("JWT VULNERABILITY TESTING")
             print_info(f"Found {len(jwt_tokens)} JWT token(s) — testing for vulnerabilities...")
 
-            for i, token in enumerate(jwt_tokens[:5], 1):  # Limit to first 5
+            for i, token in enumerate(jwt_tokens[:5], 1):
                 token_short = token[:30] + "..." if len(token) > 30 else token
                 print_info(f"Token #{i}: {token_short}")
 
-                # Test none algorithm
-                test_url = target_url.rstrip("/") + "/api/v1/me"  # Common endpoint
+                test_url = target_url.rstrip("/") + "/api/v1/me"
                 none_vuln = test_jwt_none_algorithm(token, test_url, headers, args.timeout)
                 if none_vuln:
                     print_error(f"  [CRITICAL] Algorithm 'none' bypass ACCEPTED!")
@@ -866,7 +875,6 @@ def main():
                 else:
                     print_success(f"  Algorithm 'none' bypass: rejected (safe)")
 
-                # Test weak secrets
                 weak = test_jwt_weak_secret(token)
                 if weak:
                     print_error(f"  [CRITICAL] Weak signing secret found: '{weak}'")
@@ -885,12 +893,10 @@ def main():
         if jwt_tokens_check:
             print_warn("JWT tokens found but jwt_tester module not available — install PyJWT for JWT testing")
 
-
     elapsed = time.time() - start_time
 
     print_section("SCAN COMPLETE")
 
-    # Quick list of all found endpoints
     if scored:
         border = "═" * 56
         print(f"  {border}")
@@ -914,7 +920,6 @@ def main():
     print_info(f"Scan duration         : {elapsed:.1f} seconds")
     print()
 
-    # Save reports
     try:
         txt_file, json_file, md_file = save_report(
             scored, all_secrets, target_url, args.output, stats, elapsed,
@@ -926,7 +931,6 @@ def main():
     except Exception as e:
         print_error(f"Failed to save report: {e}")
 
-    # Clean up progress file on successful completion
     delete_progress(args.output)
 
     print()
