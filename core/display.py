@@ -3,6 +3,12 @@
 import sys
 from colorama import init, Fore, Style
 
+if hasattr(sys.stdout, 'reconfigure') and sys.stdout.encoding != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 init(autoreset=True)
 
 RED = Fore.RED
