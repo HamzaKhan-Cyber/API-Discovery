@@ -1,11 +1,4 @@
-# 🔍 API-Discovery
-
-> **Hidden API Endpoint Finder** — A multi-phase Python tool for discovering exposed API endpoints, secrets, and misconfigurations in web applications.
-
-![Python](https://img.shields.io/badge/Python-3.8+-blue?style=flat-square&logo=python)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/Version-2.0-red?style=flat-square)
-![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey?style=flat-square)
+<div align="center">
 
 ```
      _    ____ ___   ____  _
@@ -18,66 +11,80 @@
           For Authorized Testing Only
 ```
 
+# 🔍 API-Discovery
+
+**Hidden API Endpoint Finder** — A multi-phase Python tool for discovering exposed API endpoints, secrets, and misconfigurations in web applications.
+
+[![Python](https://img.shields.io/badge/Python-3.8+-blue?style=flat-square&logo=python)](https://python.org)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Version](https://img.shields.io/badge/Version-2.0-red?style=flat-square)](https://github.com/HamzaKhan-Cyber/API-Discovery)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgray?style=flat-square)](https://github.com/HamzaKhan-Cyber/API-Discovery)
+
+</div>
+
+---
 
 ## ⚠️ Disclaimer
 
 > **This tool is intended for authorized security testing only.**
-> Only use on systems you own or have explicit written permission to test.
+> Only use on systems you own or have **explicit written permission** to test.
 > Unauthorized use is illegal. The author is not responsible for any misuse.
 
-
+---
 
 ## ✨ Features
 
-### 🔎 9-Phase Scanning Engine
+### 🔎 5-Phase Scanning Engine
+
 | Phase | Description |
-|-------|-------------|
+| --- | --- |
 | **Phase 1** | `robots.txt` & `sitemap.xml` parsing — nested sitemap support |
 | **Phase 2** | JavaScript file scanning — extracts API paths + 25+ secret types |
-| **Phase 3** | WAF detection (Cloudflare, AWS, Akamai, Sucuri, F5, ModSecurity) |
-| **Phase 4** | Multi-threaded wordlist bruteforce — 700+ built-in API paths |
-| **Phase 5** | Path verification with soft-404 filtering |
-| **Phase 6** | CORS misconfiguration detection (CRITICAL / HIGH / MEDIUM) |
-| **Phase 7** | Severity scoring — CRITICAL / HIGH / MEDIUM / LOW / INFO |
-| **Phase 8** | HTTP method testing (GET, POST, PUT, DELETE, PATCH, OPTIONS) |
-| **Phase 9** | JWT vulnerability testing — `alg:none` bypass + weak secret cracking |
+| **Phase 3** | WAF detection + soft-404 baseline + multi-threaded wordlist bruteforce (700+ paths) |
+| **Phase 4** | Path verification with soft-404 filtering |
+| **Phase 5** | CORS misconfiguration detection (CRITICAL / HIGH / MEDIUM) |
+
+> **Post-scan:** Severity scoring, HTTP method testing on top endpoints, JWT vulnerability testing
 
 ### 🛡️ Smart Detection
+
 - **Soft-404 detection** via `difflib.SequenceMatcher` — eliminates false positives
 - **Sliding-window rate limit detector** — auto-pause on 429, auto-delay on 403 pattern
 - **Jitter delay** — randomized timing (±50%) for WAF evasion
 - **Authenticated scanning** — Bearer token, Basic auth, Cookie, Custom headers
+- **WAF detection** — Cloudflare, AWS WAF, Akamai, Sucuri, F5, ModSecurity, Imperva
 
 ### 🔐 Secret Detection (25+ Types)
+
 - AWS Access Keys, GitHub Tokens, Google OAuth, Stripe Keys
 - JWT Tokens, Slack Webhooks, SendGrid, Mailgun, Twilio
-- Database connection strings, Hardcoded passwords, Internal IPs
+- Database connection strings, Hardcoded passwords, Internal IPs, Firebase URLs
 
 ### 📊 Output Formats
+
 - `report.txt` — Human-readable terminal report
 - `report.json` — Machine-readable structured data
-- `report.md` — Markdown report with severity tables
+- `report.md` — Markdown report with severity tables + redacted secrets
 
-
+---
 
 ## 📦 Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/HamzaKhan-Cyber/API-Discovery.git
 cd API-Discovery
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
 ### Requirements
+
 ```
 requests
 beautifulsoup4
 colorama
 urllib3
-PyJWT (optional — for JWT testing)
+lxml          # Recommended — accurate XML sitemap parsing
+PyJWT         # Optional  — enables JWT vulnerability testing
 ```
 
 ---
@@ -85,21 +92,24 @@ PyJWT (optional — for JWT testing)
 ## 🚀 Usage
 
 ### Basic Scan
+
 ```bash
 python api_discovery.py -u https://target.com
 ```
 
 ### Full Scan with All Options
+
 ```bash
 python api_discovery.py -u https://target.com \
   -t 20 \
   --delay 1 \
   --show-all \
-  --min-severity INFO \
-  --version-fuzz
+  --version-fuzz \
+  --waf-aggressive
 ```
 
 ### Authenticated Scan
+
 ```bash
 # Bearer Token
 python api_discovery.py -u https://target.com \
@@ -115,11 +125,13 @@ python api_discovery.py -u https://target.com \
 ```
 
 ### Resume Interrupted Scan
+
 ```bash
 python api_discovery.py -u https://target.com --resume
 ```
 
 ### Custom Wordlist
+
 ```bash
 python api_discovery.py -u https://target.com \
   -w /path/to/wordlist.txt
@@ -154,29 +166,8 @@ python api_discovery.py -u https://target.com \
 
 ## 📸 Sample Output
 
-### Scan Configuration
-```
-  ╔════════════════════════════════════════════════════════╗
-  ║  SCAN CONFIGURATION                                    ║
-  ╚════════════════════════════════════════════════════════╝
-  [*] Target URL   : https://juice-shop.herokuapp.com
-  [*] Threads      : 10
-  [*] Timeout      : 5s
-  [*] Status Codes : 200,201,301,302,403,405,500
-```
+### Severity Summary — OWASP Juice Shop
 
-### Secrets Found
-```
-  [!] SECRET FOUND in main.js
-            Type  : Google OAuth
-            Value : 1005568560502-6hm16lef8oh46hr2d98vf2ohlnj4nfhq...
-
-  [!] SECRET FOUND in main.js
-            Type  : Generic Secret / Password
-            Value : IamUsedForTesting
-```
-
-### Severity Summary (OWASP Juice Shop)
 ```
   ╔══════════════════════════════════════════╗
   ║          SEVERITY SUMMARY                ║
@@ -191,21 +182,28 @@ python api_discovery.py -u https://target.com \
   ╚══════════════════════════════════════════╝
 ```
 
+### Secrets Found
+
+```
+  [!] SECRET FOUND in main.js
+            Type  : Google OAuth
+            Value : 1005568560502-6hm16lef8oh46hr2d98vf2ohlnj4nfhq...
+
+  [!] SECRET FOUND in main.js
+            Type  : Generic Secret / Password
+            Value : IamUsedForTesting
+```
+
 ### CORS Findings
+
 ```
   [CORS-HIGH] rest/admin/application-configuration
     Wildcard (*) Access-Control-Allow-Origin — any site can read responses
-
-  [CORS-HIGH] support/logs
-    Wildcard (*) Access-Control-Allow-Origin — any site can read responses
 ```
 
-### Critical Endpoints Found
-```
-  [CRITICAL] [200] /rest/admin/application-version
-             Source: bruteforce
-             Reason: Contains keyword: admin | Status 200: publicly accessible
+### Critical Endpoints
 
+```
   [CRITICAL] [200] /rest/admin/application-configuration
              Source: bruteforce
              Reason: Contains keyword: admin | Status 200: publicly accessible
@@ -236,7 +234,7 @@ API-Discovery/
 ## 🧪 Tested On
 
 | Target | Findings |
-|--------|----------|
+| --- | --- |
 | OWASP Juice Shop | 434 endpoints — 61 CRITICAL, 2 secrets, 31 CORS misconfigs |
 | DVWA | ✅ Tested |
 | HackTheBox Labs | ✅ Tested |
@@ -245,10 +243,11 @@ API-Discovery/
 
 ## 👤 Author
 
-**Hamza Khan**
-- GitHub: [@HamzaKhan-Cyber](https://github.com/HamzaKhan-Cyber)
-- LinkedIn: [hamza-khan-908590287](https://linkedin.com/in/hamza-khan-908590287)
-- Medium: [@Senapi_9](https://medium.com/@Senapi_9)
+**Hamza Khan** — Cybersecurity Researcher
+
+- 🐙 GitHub: [@HamzaKhan-Cyber](https://github.com/HamzaKhan-Cyber)
+- 💼 LinkedIn: [hamza-khan-908590287](https://linkedin.com/in/hamza-khan-908590287)
+- ✍️ Medium: [@Senapi_9](https://medium.com/@Senapi_9)
 
 ---
 
@@ -258,4 +257,10 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 ---
 
+<div align="center">
+
 *Built for authorized security testing and educational purposes only.*
+
+⭐ **If this tool helped you, consider starring the repo!**
+
+</div>
