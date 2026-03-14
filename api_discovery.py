@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-API-Discovery v2.0 — Hidden API Endpoint Finder
-Main entry point: CLI parsing, scan orchestration, and report generation.
-
-Usage:
-    python api_discovery.py -u https://target.com
-    python api_discovery.py -u https://target.com -t 20 --delay 1
-    python api_discovery.py -u https://target.com --cookie "session=abc" --auth-type bearer --auth-token TOKEN
-    python api_discovery.py -u https://target.com --version-fuzz --resume
-    python api_discovery.py  (interactive mode)
-
-For Authorized Testing Only.
-"""
 
 import argparse
 import base64
@@ -350,7 +337,9 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
             f.write("\n  JWT VULNERABILITIES\n")
             f.write("  " + "-" * 60 + "\n")
             for jf in jwt_findings:
-                f.write(f"    {jf}\n")    json_path = f"{output_name}.json"
+                f.write(f"    {jf}\n")
+
+    json_path = f"{output_name}.json"
     report = {
         "tool": "API-Discovery v2.0",
         "target": target_url,
@@ -363,7 +352,9 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
         "jwt_findings": jwt_findings or [],
     }
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, default=str)    md_path = f"{output_name}.md"
+        json.dump(report, f, indent=2, default=str)
+
+    md_path = f"{output_name}.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("# API-Discovery v2.0 — Scan Report\n\n")
         f.write(f"| Field | Value |\n")
