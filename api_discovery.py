@@ -553,7 +553,9 @@ def main():
                             "source": "sitemap.xml",
                         })
             else:
-                print_error(f"{short_name} not found")    if not args.no_js:
+                print_error(f"{short_name} not found")
+
+    if not args.no_js:
         print_section("PHASE 2 — JAVASCRIPT SCANNING")
 
         print_info("Discovering JS files...")
