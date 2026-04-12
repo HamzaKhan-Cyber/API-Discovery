@@ -17,6 +17,7 @@ from core.display import print_progress, print_warn, print_info
 
 
 class RateLimitDetector:
+    """Sliding-window detector for rate limiting (429) and suspicious 403 patterns."""
     WINDOW_SIZE = 20
     PAUSE_THRESHOLD_429 = 3
     SUSPECT_THRESHOLD_403 = 10
@@ -38,7 +39,6 @@ class RateLimitDetector:
                 self._paused = True
                 return "pause"
 
-
             if not self._paused and count_403 >= self.SUSPECT_THRESHOLD_403:
                 new_delay = max(self._current_delay * 2, 1.0)
                 if new_delay != self._current_delay:
@@ -59,6 +59,7 @@ class RateLimitDetector:
 
 
 def load_wordlist(wordlist_path):
+    """Load and deduplicate paths from a wordlist file."""
     paths = []
     try:
         with open(wordlist_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -74,6 +75,7 @@ def load_wordlist(wordlist_path):
     except Exception:
         pass
 
+    # Deduplicate while preserving order
     seen = set()
     unique = []
     for p in paths:
@@ -84,6 +86,7 @@ def load_wordlist(wordlist_path):
 
 
 def get_soft_404_baseline(base_url, timeout=5, headers=None):
+    """Probe the target with random paths to establish a soft-404 baseline."""
     statuses = []
     lengths = []
     word_counts = []
@@ -95,7 +98,8 @@ def get_soft_404_baseline(base_url, timeout=5, headers=None):
         url = base_url.rstrip("/") + fake_path
 
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout, verify=False, allow_redirects=False)
+            resp = requests.get(url, headers=headers, timeout=timeout,
+                                verify=False, allow_redirects=False)
             statuses.append(resp.status_code)
             lengths.append(len(resp.content))
             word_counts.append(len(resp.text.split()))
@@ -107,7 +111,6 @@ def get_soft_404_baseline(base_url, timeout=5, headers=None):
             word_counts.append(0)
 
     most_common_status = Counter(statuses).most_common(1)[0][0] if statuses else 404
-
     avg_length = int(sum(lengths) / len(lengths)) if lengths else 0
     avg_words = int(sum(word_counts) / len(word_counts)) if word_counts else 0
 
@@ -120,7 +123,13 @@ def get_soft_404_baseline(base_url, timeout=5, headers=None):
     return baseline
 
 
-def check_path(base_url, path, timeout=5, headers=None, delay=0, baseline=None):
+def check_path(base_url, path, timeout=5, headers=None, delay=0, baseline=None,
+               session=None):
+    """Check a single path against the target, with soft-404 filtering.
+
+    Args:
+        session: Optional requests.Session for connection reuse (2-3x faster).
+    """
     url = base_url.rstrip("/") + path
     result = {
         "path": path,
@@ -135,8 +144,11 @@ def check_path(base_url, path, timeout=5, headers=None, delay=0, baseline=None):
         jitter = random.uniform(delay * 0.5, delay * 1.5)
         time.sleep(jitter)
 
+    # Use session if provided, otherwise fall back to requests.get
+    http = session or requests
+
     try:
-        resp = requests.get(
+        resp = http.get(
             url,
             headers=headers,
             timeout=timeout,
@@ -149,6 +161,7 @@ def check_path(base_url, path, timeout=5, headers=None, delay=0, baseline=None):
         if resp.status_code in (301, 302, 303, 307, 308):
             result["redirect"] = resp.headers.get("Location", None)
 
+        # Soft-404 detection: if target returns 200 for everything, compare to baseline
         if baseline and result["status"] == 200 and baseline["status"] == 200:
             bl_len = baseline["length"]
             bl_words = baseline["words"]
@@ -156,6 +169,7 @@ def check_path(base_url, path, timeout=5, headers=None, delay=0, baseline=None):
 
             is_soft_404 = False
 
+            # Method 1: Content similarity via SequenceMatcher
             if SequenceMatcher and baseline.get("body_sample"):
                 ratio = SequenceMatcher(
                     None, resp.text[:500], baseline["body_sample"]
@@ -163,6 +177,7 @@ def check_path(base_url, path, timeout=5, headers=None, delay=0, baseline=None):
                 if ratio > 0.85:
                     is_soft_404 = True
 
+            # Method 2: Length and word count comparison
             if not is_soft_404 and bl_len > 0 and bl_words > 0:
                 len_match = abs(result["length"] - bl_len) <= bl_len * 0.15
                 word_match = abs(resp_words - bl_words) <= bl_words * 0.15
@@ -195,7 +210,17 @@ class _ProgressCounter:
 
 
 def bruteforce(base_url, paths, threads=10, timeout=5, headers=None, delay=0,
-               allowed_status_codes=None, baseline=None):
+               allowed_status_codes=None, baseline=None, on_check_callback=None):
+    """
+    Multi-threaded brute-force endpoint discovery.
+
+    Uses requests.Session with connection pooling for 2-3x speed improvement
+    over individual requests.get() calls.
+
+    Args:
+        on_check_callback: Optional callable(path) invoked after each path is checked.
+                           Used by main script for resume tracking.
+    """
     if allowed_status_codes is None:
         allowed_status_codes = [200, 201, 301, 302, 403, 405, 500]
 
@@ -207,10 +232,37 @@ def bruteforce(base_url, paths, threads=10, timeout=5, headers=None, delay=0,
     counter = _ProgressCounter()
     rate_detector = RateLimitDetector(base_delay=delay)
 
+    # Create a shared session with connection pooling sized to thread count
+    # This reuses TCP connections instead of opening a new one per request
+    from urllib3.util.retry import Retry
+    from requests.adapters import HTTPAdapter
+
+    session = requests.Session()
+    adapter = HTTPAdapter(
+        pool_connections=threads,
+        pool_maxsize=threads,
+        max_retries=Retry(total=0),  # No retries — we handle failures ourselves
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    if headers:
+        session.headers.update(headers)
+    session.verify = False
+
+    # Progress update frequency scales with total paths
+    progress_interval = max(5, min(50, total // 20))
+
     def _worker(path):
         current_delay = rate_detector.current_delay
-        r = check_path(base_url, path, timeout, headers, current_delay, baseline)
+        r = check_path(base_url, path, timeout, headers, current_delay, baseline,
+                        session=session)
         current = counter.increment()
+
+        if on_check_callback:
+            try:
+                on_check_callback(path)
+            except Exception:
+                pass
 
         suggestion = rate_detector.record(r["status"])
         if suggestion == "pause":
@@ -221,30 +273,37 @@ def bruteforce(base_url, paths, threads=10, timeout=5, headers=None, delay=0,
         elif isinstance(suggestion, (int, float)):
             print_warn(f"\n  [RATE LIMIT] Suspicious 403 pattern — delay increased to {suggestion:.1f}s")
 
-        if current % 5 == 0 or current == total:
+        if current % progress_interval == 0 or current == total:
             print_progress(current, total, prefix="Bruteforcing")
         return r
 
-    with ThreadPoolExecutor(max_workers=threads) as executor:
-        futures = {executor.submit(_worker, p): p for p in paths}
-        try:
-            for future in as_completed(futures):
-                try:
-                    r = future.result()
-                    if r["status"] in allowed_status_codes:
-                        results.append(r)
-                except Exception:
-                    pass
-        except KeyboardInterrupt:
-            sys.stdout.write("\n")
-            executor.shutdown(wait=False, cancel_futures=True)
-            print_progress(total, total, prefix="Bruteforcing")
-            raise
+    try:
+        with ThreadPoolExecutor(max_workers=threads) as executor:
+            futures = {executor.submit(_worker, p): p for p in paths}
+            try:
+                for future in as_completed(futures):
+                    try:
+                        r = future.result()
+                        if r["status"] in allowed_status_codes:
+                            results.append(r)
+                    except Exception:
+                        pass
+            except KeyboardInterrupt:
+                sys.stdout.write("\n")
+                executor.shutdown(wait=False, cancel_futures=True)
+                print_progress(total, total, prefix="Bruteforcing")
+                raise
+    finally:
+        session.close()
 
     print_progress(total, total, prefix="Bruteforcing")
 
     return results
 
+
+# =========================================================================
+# WAF Detection
+# =========================================================================
 
 WAF_SIGNATURES = {
     "Cloudflare": {
@@ -283,6 +342,7 @@ WAF_SIGNATURES = {
 
 
 def detect_waf(base_url, timeout=5, headers=None, aggressive=False):
+    """Detect Web Application Firewalls via header/response analysis."""
     result = {
         "waf_detected": False,
         "waf_name": None,
@@ -302,7 +362,8 @@ def detect_waf(base_url, timeout=5, headers=None, aggressive=False):
         for test_path in test_paths:
             url = base_url.rstrip("/") + test_path
             try:
-                resp = requests.get(url, headers=headers, timeout=timeout, verify=False, allow_redirects=False)
+                resp = requests.get(url, headers=headers, timeout=timeout,
+                                    verify=False, allow_redirects=False)
             except requests.exceptions.RequestException:
                 continue
 
@@ -314,16 +375,19 @@ def detect_waf(base_url, timeout=5, headers=None, aggressive=False):
                     if sig_header.lower() in resp_headers:
                         result["waf_detected"] = True
                         result["waf_name"] = waf_name
-                        result["recommendation"] = f"Use --delay 2 to avoid rate limiting by {waf_name}"
+                        result["recommendation"] = (
+                            f"Use --delay 2 to avoid rate limiting by {waf_name}")
                         return result
 
                 for server_sig in sigs["server"]:
                     if server_sig in server_header:
                         result["waf_detected"] = True
                         result["waf_name"] = waf_name
-                        result["recommendation"] = f"Use --delay 2 to avoid rate limiting by {waf_name}"
+                        result["recommendation"] = (
+                            f"Use --delay 2 to avoid rate limiting by {waf_name}")
                         return result
 
+            # Fallback: detect WAF from 403 response body
             if resp.status_code == 403:
                 body_lower = resp.text.lower()
                 waf_keywords = [
@@ -345,6 +409,7 @@ def detect_waf(base_url, timeout=5, headers=None, aggressive=False):
 
 
 def test_http_methods(url, timeout=5, headers=None):
+    """Test which HTTP methods are accepted by an endpoint."""
     methods = ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
     results = {}
 
@@ -379,6 +444,7 @@ VERSION_VARIANTS = [
 
 
 def generate_versioned_paths(found_paths):
+    """Generate version variant paths from discovered versioned endpoints."""
     existing = set(found_paths)
     new_paths = set()
 

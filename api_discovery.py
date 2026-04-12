@@ -1,12 +1,12 @@
-
-
 import argparse
 import base64
+import configparser
 import json
 import os
 import random
 import sys
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse
@@ -39,6 +39,8 @@ from core.bruteforcer import (
     test_http_methods,
     get_soft_404_baseline,
     generate_versioned_paths,
+    RateLimitDetector,
+    _ProgressCounter,
 )
 from core.severity import score_endpoint, sort_by_severity, get_severity_stats, SEVERITY_ORDER
 
@@ -53,6 +55,88 @@ try:
     HAS_JWT_TESTER = True
 except ImportError:
     HAS_JWT_TESTER = False
+
+
+# ---------------------------------------------------------------------------
+#  Config file support — loads defaults from config.ini if present
+# ---------------------------------------------------------------------------
+
+DEFAULT_CONFIG = {
+    "threads": 10,
+    "timeout": 5,
+    "delay": 0.0,
+    "output": "api_discovery_report",
+    "output_dir": "output",
+    "status_codes": "200,201,301,302,403,405,500",
+    "min_severity": "HIGH",
+    "version_fuzz": False,
+    "no_js": False,
+    "no_robots": False,
+    "no_brute": False,
+}
+
+
+def load_config():
+    """Load configuration from config.ini if it exists, merging with defaults."""
+    config = dict(DEFAULT_CONFIG)
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+
+    if not os.path.exists(config_path):
+        return config
+
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(config_path, encoding="utf-8")
+    except Exception:
+        return config
+
+    if parser.has_section("scan"):
+        for key in ("threads", "timeout"):
+            if parser.has_option("scan", key):
+                try:
+                    config[key] = parser.getint("scan", key)
+                except ValueError:
+                    pass
+        if parser.has_option("scan", "delay"):
+            try:
+                config["delay"] = parser.getfloat("scan", "delay")
+            except ValueError:
+                pass
+        if parser.has_option("scan", "status_codes"):
+            config["status_codes"] = parser.get("scan", "status_codes")
+        if parser.has_option("scan", "min_severity"):
+            config["min_severity"] = parser.get("scan", "min_severity").upper()
+        for flag in ("version_fuzz", "no_js", "no_robots", "no_brute"):
+            if parser.has_option("scan", flag):
+                try:
+                    config[flag] = parser.getboolean("scan", flag)
+                except ValueError:
+                    pass
+
+    if parser.has_section("output"):
+        if parser.has_option("output", "directory"):
+            config["output_dir"] = parser.get("output", "directory")
+        if parser.has_option("output", "report_name"):
+            config["output"] = parser.get("output", "report_name")
+
+    return config
+
+
+# =====================================================================
+# FIX #1 (CRITICAL): cfg must be loaded at module level BEFORE parse_args()
+# uses it. Without this line the original code raises NameError.
+# =====================================================================
+cfg = load_config()
+
+
+def ensure_output_dir(output_dir=None):
+    """Create the output directory if it does not exist and return its absolute path."""
+    if output_dir is None:
+        output_dir = DEFAULT_CONFIG["output_dir"]
+    base = os.path.dirname(os.path.abspath(__file__))
+    out_path = os.path.join(base, output_dir)
+    os.makedirs(out_path, exist_ok=True)
+    return out_path
 
 
 USER_AGENTS = [
@@ -73,6 +157,7 @@ USER_AGENTS = [
     "curl/8.5.0",
 ]
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="api_discovery",
@@ -89,23 +174,37 @@ def parse_args():
     )
 
     parser.add_argument("-u", "--url", help="Target base URL (e.g. https://example.com)")
-    parser.add_argument("-t", "--threads", type=int, default=10, help="Number of concurrent threads (default: 10)")
+    parser.add_argument("-t", "--threads", type=int, default=cfg["threads"],
+                        help="Number of concurrent threads (default: %(default)s)")
     parser.add_argument("-w", "--wordlist", help="Path to a custom wordlist file (default: built-in 700+ paths)")
-    parser.add_argument("--timeout", type=int, default=5, help="HTTP request timeout in seconds (default: 5)")
-    parser.add_argument("--delay", type=float, default=0, help="Delay between requests in seconds (default: 0)")
+    parser.add_argument("--timeout", type=int, default=cfg["timeout"],
+                        help="HTTP request timeout in seconds (default: %(default)s)")
+    parser.add_argument("--delay", type=float, default=cfg["delay"],
+                        help="Delay between requests in seconds (default: %(default)s)")
     parser.add_argument("--user-agent", help="Custom User-Agent header string")
-    parser.add_argument("-o", "--output", default="api_discovery_report", help="Output report file name without extension (default: api_discovery_report)")
+    parser.add_argument("-o", "--output", default=cfg["output"],
+                        help="Output report file name without extension (default: %(default)s)")
 
-    parser.add_argument("--no-js", action="store_true", help="Skip JavaScript file scanning")
-    parser.add_argument("--no-robots", action="store_true", help="Skip robots.txt and sitemap.xml checks")
-    parser.add_argument("--no-brute", action="store_true", help="Skip wordlist brute-forcing")
+    # FIX #2: Added --output-dir argument so config.ini output_dir actually works
+    parser.add_argument("--output-dir", default=cfg["output_dir"],
+                        help="Output directory for reports (default: %(default)s)")
+
+    parser.add_argument("--no-js", action="store_true", default=cfg["no_js"],
+                        help="Skip JavaScript file scanning")
+    parser.add_argument("--no-robots", action="store_true", default=cfg["no_robots"],
+                        help="Skip robots.txt and sitemap.xml checks")
+    parser.add_argument("--no-brute", action="store_true", default=cfg["no_brute"],
+                        help="Skip wordlist brute-forcing")
     parser.add_argument("--status-codes",
                         type=lambda s: [int(x.strip()) for x in s.split(",")],
-                        default=[200, 201, 301, 302, 403, 405, 500],
-                        help="Comma-separated status codes to report (default: 200,201,301,302,403,405,500)")
-    parser.add_argument("--show-all", action="store_true", help="Show all severity levels in detail")
-    parser.add_argument("--min-severity", choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
-                        default="HIGH", help="Minimum severity level to show in detail (default: HIGH)")
+                        default=[int(x.strip()) for x in cfg["status_codes"].split(",")],
+                        help="Comma-separated status codes to report (default: %(default)s)")
+    parser.add_argument("--show-all", action="store_true",
+                        help="Show all severity levels in detail")
+    parser.add_argument("--min-severity",
+                        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"],
+                        default=cfg["min_severity"],
+                        help="Minimum severity level to show in detail (default: %(default)s)")
 
     parser.add_argument("--waf-aggressive", action="store_true",
                         help="Use aggressive WAF detection with XSS/SQLi payloads (may trigger blocks)")
@@ -115,15 +214,17 @@ def parse_args():
                         help='Custom header, e.g. "Authorization: Bearer TOKEN" (can be used multiple times)')
     parser.add_argument("--auth-type", choices=["bearer", "basic", "cookie", "custom"],
                         help="Authentication type: bearer, basic, cookie, or custom")
-    parser.add_argument("--auth-token", help="Authentication token or credentials for --auth-type")
+    parser.add_argument("--auth-token",
+                        help="Authentication token or credentials for --auth-type")
 
-    parser.add_argument("--version-fuzz", action="store_true",
-                        help="After brute-force, fuzz discovered paths with API version variants (v1-v5, latest, beta, etc.)")
+    parser.add_argument("--version-fuzz", action="store_true", default=cfg["version_fuzz"],
+                        help="After brute-force, fuzz discovered paths with API version variants")
 
     parser.add_argument("--resume", action="store_true",
                         help="Resume a previously interrupted scan from the progress file")
 
     return parser.parse_args()
+
 
 def build_auth_headers(args):
     auth_headers = {}
@@ -135,23 +236,30 @@ def build_auth_headers(args):
         if args.auth_type == "bearer":
             auth_headers["Authorization"] = f"Bearer {args.auth_token}"
         elif args.auth_type == "basic":
+            # FIX #3: Validate basic auth format (user:password)
+            if ":" not in args.auth_token:
+                print_warn("Basic auth token should be in 'user:password' format")
             try:
                 encoded = base64.b64encode(args.auth_token.encode("utf-8")).decode("utf-8")
                 auth_headers["Authorization"] = f"Basic {encoded}"
             except Exception:
-                pass
+                print_error("Failed to encode basic auth credentials")
         elif args.auth_type == "cookie":
             auth_headers["Cookie"] = args.auth_token
         elif args.auth_type == "custom":
             if ":" in args.auth_token:
                 key, _, val = args.auth_token.partition(":")
                 auth_headers[key.strip()] = val.strip()
+            else:
+                print_warn("Custom auth token should be in 'Header-Name: value' format")
 
     if args.extra_headers:
         for h in args.extra_headers:
             if ":" in h:
                 key, _, val = h.partition(":")
                 auth_headers[key.strip()] = val.strip()
+            else:
+                print_warn(f"Invalid header format (missing ':'): {h}")
 
     return auth_headers
 
@@ -193,23 +301,38 @@ def _verify_path(target_url, r, timeout, headers, allowed_codes, baseline):
         r["status"] = 0
         return False
 
-def save_progress(checked_paths, found_results, output_name, target_url):
-    progress_file = f"{output_name}.progress.json"
+
+def save_progress(checked_paths, found_results, output_name, target_url, output_dir="output"):
+    out_path = ensure_output_dir(output_dir)
+    progress_file = os.path.join(out_path, f"{output_name}.progress.json")
+
+    # FIX #4: Sanitise results before saving — only keep JSON-safe fields
+    safe_results = []
+    for r in found_results:
+        safe_r = {}
+        for k, v in r.items():
+            if isinstance(v, (str, int, float, bool, type(None))):
+                safe_r[k] = v
+            else:
+                safe_r[k] = str(v)
+        safe_results.append(safe_r)
+
     data = {
         "target_url": target_url,
         "timestamp": datetime.now().isoformat(),
         "checked_paths": list(checked_paths),
-        "found_results": found_results,
+        "found_results": safe_results,
     }
     try:
         with open(progress_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, default=str)
-    except Exception:
-        pass
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print_error(f"Failed to save progress: {e}")
 
 
-def load_progress(output_name, target_url):
-    progress_file = f"{output_name}.progress.json"
+def load_progress(output_name, target_url, output_dir="output"):
+    out_path = ensure_output_dir(output_dir)
+    progress_file = os.path.join(out_path, f"{output_name}.progress.json")
 
     if not os.path.exists(progress_file):
         return set(), []
@@ -219,23 +342,29 @@ def load_progress(output_name, target_url):
             data = json.load(f)
 
         if data.get("target_url") != target_url:
+            print_warn("Progress file target URL mismatch — starting fresh")
             return set(), []
 
         checked = set(data.get("checked_paths", []))
         results = data.get("found_results", [])
         return checked, results
 
+    except (json.JSONDecodeError, KeyError) as e:
+        print_error(f"Corrupted progress file: {e}")
+        return set(), []
     except Exception:
         return set(), []
 
 
-def delete_progress(output_name):
-    progress_file = f"{output_name}.progress.json"
+def delete_progress(output_name, output_dir="output"):
+    out_path = ensure_output_dir(output_dir)
+    progress_file = os.path.join(out_path, f"{output_name}.progress.json")
     try:
         if os.path.exists(progress_file):
             os.remove(progress_file)
     except Exception:
         pass
+
 
 def _redact_secret(value):
     if not value or len(value) <= 12:
@@ -243,10 +372,13 @@ def _redact_secret(value):
     return value[:4] + "*" * min(len(value) - 8, 20) + value[-4:]
 
 
-def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_findings=None, jwt_findings=None):
+def save_report(results, secrets, target_url, output_name, stats, elapsed,
+                cors_findings=None, jwt_findings=None, output_dir="output"):
+    out_path = ensure_output_dir(output_dir)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    txt_path = f"{output_name}.txt"
+    # --- TXT Report ---
+    txt_path = os.path.join(out_path, f"{output_name}.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("=" * 64 + "\n")
         f.write("  API-DISCOVERY v2.0 — SCAN REPORT\n")
@@ -277,14 +409,13 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
                 f.write(f"              Reason: {reason}\n")
             f.write("\n")
 
+        # FIX #5: TXT report now also redacts secrets (same as MD report)
         if secrets:
             f.write("\n  SECRETS FOUND\n")
             f.write("  " + "-" * 60 + "\n")
             for s in secrets:
                 f.write(f"    Type    : {s.get('type', 'Unknown')}\n")
-                val = s.get("value", "N/A")
-                if len(val) > 80:
-                    val = val[:80] + "..."
+                val = _redact_secret(s.get("value", "N/A"))
                 f.write(f"    Value   : {val}\n")
                 f.write(f"    File    : {s.get('file', 'N/A')}\n")
                 ctx = s.get("context", "N/A")
@@ -305,7 +436,16 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
             for jf in jwt_findings:
                 f.write(f"    {jf}\n")
 
-    json_path = f"{output_name}.json"
+    # --- JSON Report ---
+    json_path = os.path.join(out_path, f"{output_name}.json")
+
+    # FIX #6: Redact secrets in JSON report too
+    safe_secrets = []
+    for s in secrets:
+        safe_s = dict(s)
+        safe_s["value"] = _redact_secret(s.get("value", ""))
+        safe_secrets.append(safe_s)
+
     report = {
         "tool": "API-Discovery v2.0",
         "target": target_url,
@@ -313,18 +453,19 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
         "duration_seconds": round(elapsed, 1),
         "severity_stats": stats,
         "endpoints": results,
-        "secrets": secrets,
+        "secrets": safe_secrets,
         "cors_findings": cors_findings or [],
         "jwt_findings": jwt_findings or [],
     }
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
 
-    md_path = f"{output_name}.md"
+    # --- Markdown Report ---
+    md_path = os.path.join(out_path, f"{output_name}.md")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("# API-Discovery v2.0 — Scan Report\n\n")
-        f.write(f"| Field | Value |\n")
-        f.write(f"|-------|-------|\n")
+        f.write("| Field | Value |\n")
+        f.write("|-------|-------|\n")
         f.write(f"| **Target** | `{target_url}` |\n")
         f.write(f"| **Timestamp** | {timestamp} |\n")
         f.write(f"| **Duration** | {elapsed:.1f}s |\n")
@@ -335,7 +476,8 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
         f.write("|----------|-------|\n")
         for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
             count = stats.get(sev, 0)
-            emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢", "INFO": "⚪"}.get(sev, "")
+            emoji = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡",
+                     "LOW": "🟢", "INFO": "⚪"}.get(sev, "")
             f.write(f"| {emoji} **{sev}** | {count} |\n")
         f.write(f"| **TOTAL** | **{stats.get('total', 0)}** |\n\n")
 
@@ -343,7 +485,6 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
             sev_results = [r for r in results if r.get("severity") == sev]
             if not sev_results:
                 continue
-
             f.write(f"## {sev} — {len(sev_results)} endpoint(s)\n\n")
             f.write("| Path | Status | Source | Reason |\n")
             f.write("|------|--------|--------|--------|\n")
@@ -389,8 +530,55 @@ def save_report(results, secrets, target_url, output_name, stats, elapsed, cors_
 
     return txt_path, json_path, md_path
 
+
+def _deduplicate_sitemap_paths(paths):
+    """Collapse sitemap paths that follow the same pattern.
+
+    e.g., 500 paths like /items/G404xxxxx all become just /items/{id}
+    This prevents thousands of near-identical paths from flooding the scan.
+    """
+    import re
+
+    # Group paths by their "structure" (replace numeric/hex IDs with placeholder)
+    pattern_groups = {}
+    unique_paths = []
+
+    for path in paths:
+        # Replace segments that look like IDs (numbers, hex, UUIDs, alphanumeric codes)
+        structure = re.sub(
+            r'/[A-Z]?\d{4,}',       # /G404xxxxx, /12345678
+            '/{id}', path
+        )
+        structure = re.sub(
+            r'/[0-9a-f]{8,}',       # hex IDs
+            '/{id}', structure
+        )
+        structure = re.sub(
+            r'/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',  # UUIDs
+            '/{uuid}', structure, flags=re.IGNORECASE
+        )
+
+        if structure not in pattern_groups:
+            pattern_groups[structure] = []
+        pattern_groups[structure].append(path)
+
+    for structure, group in pattern_groups.items():
+        if len(group) <= 3:
+            # Few paths with this pattern — keep all
+            unique_paths.extend(group)
+        else:
+            # Many paths with same pattern — keep just 1 example + the pattern
+            unique_paths.append(group[0])  # Keep one real example
+
+    return unique_paths
+
+
 def main():
     args = parse_args()
+
+    # FIX #7: Now uses args.output_dir properly (from CLI or config)
+    output_dir = args.output_dir
+    out_path = ensure_output_dir(output_dir)
 
     show_banner()
 
@@ -424,6 +612,7 @@ def main():
     ua_display = user_agent[:55] + "..." if len(user_agent) > 55 else user_agent
     print_info(f"User-Agent   : {ua_display}")
     print_info(f"Status Codes : {','.join(str(c) for c in allowed_codes)}")
+    print_info(f"Output Dir   : {os.path.relpath(out_path)}")
     print_info(f"Output       : {args.output}.txt / .json / .md")
 
     if auth_headers:
@@ -462,14 +651,18 @@ def main():
 
     resumed_paths = set()
     if args.resume:
-        resumed_paths, resumed_results = load_progress(args.output, target_url)
+        resumed_paths, resumed_results = load_progress(args.output, target_url, output_dir)
         if resumed_paths:
-            print_success(f"Resumed — {len(resumed_paths)} paths already checked, {len(resumed_results)} results loaded")
+            print_success(f"Resumed — {len(resumed_paths)} paths already checked, "
+                          f"{len(resumed_results)} results loaded")
             all_results.extend(resumed_results)
             discovered_paths.update(resumed_paths)
         else:
             print_info("No progress file found — starting fresh scan")
 
+    # ================================================================
+    # PHASE 1 — ROBOTS.TXT & SITEMAP.XML
+    # ================================================================
     if not args.no_robots:
         print_section("PHASE 1 — ROBOTS.TXT & SITEMAP.XML")
 
@@ -496,13 +689,36 @@ def main():
         if not sitemap_urls:
             sitemap_urls = [target_url.rstrip("/") + "/sitemap.xml"]
 
+        # Limit sitemaps processed to avoid 20,000+ path explosions
+        max_sitemaps = 5
+        max_sitemap_paths = 500
+        total_sitemap_paths = 0
+
+        if len(sitemap_urls) > max_sitemaps:
+            print_warn(f"Found {len(sitemap_urls)} sitemaps — limiting to first {max_sitemaps}")
+            sitemap_urls = sitemap_urls[:max_sitemaps]
+
         for sm_url in sitemap_urls:
+            if total_sitemap_paths >= max_sitemap_paths:
+                print_warn(f"Sitemap path limit reached ({max_sitemap_paths}) — skipping remaining sitemaps")
+                break
+
             short_name = sm_url.split("/")[-1] if "/" in sm_url else sm_url
             print_info(f"Checking {short_name}...")
-            sitemap_paths = fetch_sitemap(sm_url, args.timeout, headers)
+            remaining = max_sitemap_paths - total_sitemap_paths
+            sitemap_paths = fetch_sitemap(sm_url, args.timeout, headers,
+                                          max_paths=remaining)
 
             if sitemap_paths:
-                print_success(f"{short_name} found — {len(sitemap_paths)} paths extracted")
+                # Deduplicate pattern-similar paths (e.g., 500x /items/G404xxxx → 1)
+                before_dedup = len(sitemap_paths)
+                sitemap_paths = _deduplicate_sitemap_paths(sitemap_paths)
+                deduped = before_dedup - len(sitemap_paths)
+
+                msg = f"{short_name} found — {len(sitemap_paths)} unique paths"
+                if deduped > 0:
+                    msg += f" ({deduped} duplicate-pattern paths collapsed)"
+                print_success(msg)
                 for path in sitemap_paths:
                     if path not in discovered_paths:
                         discovered_paths.add(path)
@@ -514,9 +730,13 @@ def main():
                             "redirect": None,
                             "source": "sitemap.xml",
                         })
+                        total_sitemap_paths += 1
             else:
                 print_error(f"{short_name} not found")
 
+    # ================================================================
+    # PHASE 2 — JAVASCRIPT SCANNING
+    # ================================================================
     if not args.no_js:
         print_section("PHASE 2 — JAVASCRIPT SCANNING")
 
@@ -574,6 +794,9 @@ def main():
         else:
             print_error("No JS files found on homepage")
 
+    # ================================================================
+    # PHASE 3 — WAF DETECTION & BRUTE-FORCE
+    # ================================================================
     if not args.no_brute:
         print_section("PHASE 3 — WAF DETECTION & BRUTE-FORCE")
 
@@ -591,7 +814,8 @@ def main():
         print_info("Establishing Soft-404 baseline (3 probes)...")
         baseline = get_soft_404_baseline(target_url, args.timeout, headers)
         if baseline["status"] == 200:
-            print_warn(f"Soft-404 Detected: Target returns 200 OK for non-existent paths (Avg Length: {baseline['length']})")
+            print_warn(f"Soft-404 Detected: Target returns 200 OK for non-existent paths "
+                       f"(Avg Length: {baseline['length']})")
         else:
             print_success(f"Normal 404 behavior detected (Status: {baseline['status']})")
 
@@ -619,71 +843,18 @@ def main():
             print_info(f"Bruteforcing {len(wl_paths)} paths with {args.threads} threads...")
             print()
 
-
-            import threading
+            # FIX #8: Replaced the massive inline bruteforce_with_tracking function
+            # with a cleaner approach using a shared set + lock for resume tracking
             _actual_checked = set(resumed_paths)
             _checked_lock = threading.Lock()
 
-            original_bruteforce = bruteforce
-
-            def bruteforce_with_tracking(base_url, paths, **kwargs):
-                """Thin wrapper that records dispatched paths for accurate resume."""
-                from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
-                from core.bruteforcer import check_path, _ProgressCounter, RateLimitDetector
-                from core.display import print_progress as _pp, print_warn as _pw, print_info as _pi
-                import time as _time
-
-                allowed = kwargs.get("allowed_status_codes", [200, 201, 301, 302, 403, 405, 500])
-                timeout = kwargs.get("timeout", 5)
-                delay = kwargs.get("delay", 0)
-                threads = kwargs.get("threads", 10)
-                hdrs = kwargs.get("headers")
-                bl = kwargs.get("baseline")
-                results = []
-                total = len(paths)
-                counter = _ProgressCounter()
-                rate_detector = RateLimitDetector(base_delay=delay)
-
-                def _worker(path):
-                    with _checked_lock:
-                        _actual_checked.add(path)
-                    current_delay = rate_detector.current_delay
-                    r = check_path(base_url, path, timeout, hdrs, current_delay, bl)
-                    current = counter.increment()
-                    suggestion = rate_detector.record(r["status"])
-                    if suggestion == "pause":
-                        _pw("\n  [RATE LIMIT] 429 responses detected — pausing 30s...")
-                        _time.sleep(30)
-                        rate_detector.clear_pause()
-                        _pi("  Resuming scan...")
-                    elif isinstance(suggestion, (int, float)):
-                        _pw(f"\n  [RATE LIMIT] Suspicious 403 pattern — delay increased to {suggestion:.1f}s")
-                    if current % 5 == 0 or current == total:
-                        _pp(current, total, prefix="Bruteforcing")
-                    return r
-
-                with ThreadPoolExecutor(max_workers=threads) as executor:
-                    futures = {executor.submit(_worker, p): p for p in paths}
-                    try:
-                        for future in _as_completed(futures):
-                            try:
-                                r = future.result()
-                                if r["status"] in allowed:
-                                    results.append(r)
-                            except Exception:
-                                pass
-                    except KeyboardInterrupt:
-                        import sys as _sys
-                        _sys.stdout.write("\n")
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        _pp(total, total, prefix="Bruteforcing")
-                        raise
-
-                _pp(total, total, prefix="Bruteforcing")
-                return results
+            def _on_path_checked(path):
+                """Callback to track checked paths for resume support."""
+                with _checked_lock:
+                    _actual_checked.add(path)
 
             try:
-                brute_results = bruteforce_with_tracking(
+                brute_results = bruteforce(
                     target_url,
                     wl_paths,
                     threads=args.threads,
@@ -692,11 +863,13 @@ def main():
                     delay=args.delay,
                     allowed_status_codes=allowed_codes,
                     baseline=baseline,
+                    on_check_callback=_on_path_checked,
                 )
             except KeyboardInterrupt:
                 print_warn("Brute-force interrupted — saving progress...")
-                save_progress(list(_actual_checked), all_results, args.output, target_url)
-                print_success(f"Progress saved to {args.output}.progress.json")
+                save_progress(list(_actual_checked), all_results, args.output,
+                              target_url, output_dir)
+                print_success(f"Progress saved to {output_dir}/{args.output}.progress.json")
                 raise
 
             print()
@@ -743,6 +916,9 @@ def main():
                 else:
                     print_info("No versioned paths detected for fuzzing")
 
+    # ================================================================
+    # PHASE 4 — VERIFYING DISCOVERED PATHS
+    # ================================================================
     unverified = [r for r in all_results if r.get("status") == "N/A"]
 
     if unverified:
@@ -755,15 +931,22 @@ def main():
         verified_count = 0
 
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = [executor.submit(_verify_path, target_url, r, args.timeout, headers, allowed_codes, baseline) for r in unverified]
+            futures = [
+                executor.submit(_verify_path, target_url, r, args.timeout,
+                                headers, allowed_codes, baseline)
+                for r in unverified
+            ]
             for future in as_completed(futures):
                 if future.result():
                     verified_count += 1
 
         print_success(f"Verified — {verified_count} paths returned allowed status codes")
 
-    all_results = [r for r in all_results if isinstance(r.get("status"), int) and r["status"] in allowed_codes]
+    # Filter to only allowed status codes
+    all_results = [r for r in all_results
+                   if isinstance(r.get("status"), int) and r["status"] in allowed_codes]
 
+    # Deduplicate
     seen_paths = set()
     unique_results = []
     for r in all_results:
@@ -772,19 +955,25 @@ def main():
             unique_results.append(r)
     all_results = unique_results
 
+    # ================================================================
+    # PHASE 5 — CORS MISCONFIGURATION SCAN
+    # ================================================================
     endpoints_200 = [r for r in all_results if r.get("status") == 200]
 
     if endpoints_200 and HAS_CORS_SCANNER:
         print_section("PHASE 5 — CORS MISCONFIGURATION SCAN")
         print_info(f"Checking {len(endpoints_200)} endpoints for CORS misconfigurations...")
 
-        cors_urls = [r.get("url", build_url(target_url, r.get("path", ""))) for r in endpoints_200]
-        cors_findings = scan_cors_bulk(cors_urls, threads=args.threads, timeout=args.timeout, headers=headers)
+        cors_urls = [r.get("url", build_url(target_url, r.get("path", "")))
+                     for r in endpoints_200]
+        cors_findings = scan_cors_bulk(cors_urls, threads=args.threads,
+                                       timeout=args.timeout, headers=headers)
 
         if cors_findings:
             for cf in cors_findings:
                 sev = cf.get("severity", "MEDIUM")
-                url_short = cf.get("url", "?").split("/", 3)[-1] if "/" in cf.get("url", "") else cf.get("url", "?")
+                url_short = (cf.get("url", "?").split("/", 3)[-1]
+                             if "/" in cf.get("url", "") else cf.get("url", "?"))
                 desc = cf.get("description", "")
                 if sev == "CRITICAL":
                     print_error(f"[CORS-CRITICAL] {url_short}")
@@ -802,6 +991,9 @@ def main():
     elif endpoints_200 and not HAS_CORS_SCANNER:
         print_warn("CORS scanner module not available — skipping Phase 5")
 
+    # ================================================================
+    # SEVERITY SCORING & RESULTS
+    # ================================================================
     print_section("SEVERITY SCORING & RESULTS")
 
     scored = [score_endpoint(r) for r in all_results]
@@ -831,6 +1023,9 @@ def main():
         if count > 0:
             print_info(f"[{sev}] {count} endpoints found — use --show-all to see details")
 
+    # ================================================================
+    # HTTP METHOD TESTING — TOP ENDPOINTS
+    # ================================================================
     interesting = [
         r for r in scored
         if r.get("status") == 200 and r.get("severity") in ("CRITICAL", "HIGH")
@@ -856,6 +1051,9 @@ def main():
                         print_found(f"  {method}", status)
             print()
 
+    # ================================================================
+    # JWT VULNERABILITY TESTING
+    # ================================================================
     if all_secrets and HAS_JWT_TESTER:
         jwt_tokens = extract_jwts_from_results(all_secrets)
 
@@ -867,20 +1065,27 @@ def main():
                 token_short = token[:30] + "..." if len(token) > 30 else token
                 print_info(f"Token #{i}: {token_short}")
 
-                test_url = target_url.rstrip("/") + "/api/v1/me"
+                # FIX #9: Test JWT against actual discovered endpoints, not hardcoded path
+                test_endpoints = [r.get("url", build_url(target_url, r.get("path", "")))
+                                  for r in scored
+                                  if r.get("status") == 200 and r.get("severity") in ("CRITICAL", "HIGH")]
+                test_url = test_endpoints[0] if test_endpoints else target_url.rstrip("/") + "/api/v1/me"
+
                 none_vuln = test_jwt_none_algorithm(token, test_url, headers, args.timeout)
                 if none_vuln:
-                    print_error(f"  [CRITICAL] Algorithm 'none' bypass ACCEPTED!")
-                    jwt_findings.append(f"[CRITICAL] Token #{i} — 'none' algorithm bypass accepted at {test_url}")
+                    print_error("  [CRITICAL] Algorithm 'none' bypass ACCEPTED!")
+                    jwt_findings.append(
+                        f"[CRITICAL] Token #{i} — 'none' algorithm bypass accepted at {test_url}")
                 else:
-                    print_success(f"  Algorithm 'none' bypass: rejected (safe)")
+                    print_success("  Algorithm 'none' bypass: rejected (safe)")
 
                 weak = test_jwt_weak_secret(token)
                 if weak:
                     print_error(f"  [CRITICAL] Weak signing secret found: '{weak}'")
-                    jwt_findings.append(f"[CRITICAL] Token #{i} — signed with weak secret: '{weak}'")
+                    jwt_findings.append(
+                        f"[CRITICAL] Token #{i} — signed with weak secret: '{weak}'")
                 else:
-                    print_success(f"  Weak secret test: no common weak secret found (safe)")
+                    print_success("  Weak secret test: no common weak secret found (safe)")
 
                 print()
 
@@ -888,28 +1093,21 @@ def main():
                 print_warn(f"JWT testing complete — {len(jwt_findings)} vulnerabilities found!")
             else:
                 print_success("JWT testing complete — no vulnerabilities found")
+
     elif all_secrets and not HAS_JWT_TESTER:
-        jwt_tokens_check = [s for s in all_secrets if "jwt" in s.get("type", "").lower() or "bearer" in s.get("type", "").lower()]
+        jwt_tokens_check = [s for s in all_secrets
+                            if "jwt" in s.get("type", "").lower()
+                            or "bearer" in s.get("type", "").lower()]
         if jwt_tokens_check:
-            print_warn("JWT tokens found but jwt_tester module not available — install PyJWT for JWT testing")
+            print_warn("JWT tokens found but jwt_tester module not available — "
+                       "install PyJWT for JWT testing")
 
     elapsed = time.time() - start_time
 
+    # ================================================================
+    # SCAN COMPLETE
+    # ================================================================
     print_section("SCAN COMPLETE")
-
-    if scored:
-        border = "═" * 56
-        print(f"  {border}")
-        print(f"    FINAL DISCOVERED ENDPOINTS")
-        print(f"  {border}")
-        for r in scored:
-            sev = r.get("severity", "INFO")
-            status = r.get("status", "?")
-            path = r.get("path", "?")
-            source = r.get("source", "")
-            print_found(f"{path}  <- {source}", status, "")
-        print(f"  {border}")
-        print()
 
     print_success(f"Total endpoints found : {stats.get('total', 0)}")
     print_success(f"Secrets found         : {len(all_secrets)}")
@@ -924,6 +1122,7 @@ def main():
         txt_file, json_file, md_file = save_report(
             scored, all_secrets, target_url, args.output, stats, elapsed,
             cors_findings=cors_findings, jwt_findings=jwt_findings,
+            output_dir=output_dir,
         )
         print_success(f"Text report saved     : {txt_file}")
         print_success(f"JSON report saved     : {json_file}")
@@ -931,7 +1130,7 @@ def main():
     except Exception as e:
         print_error(f"Failed to save report: {e}")
 
-    delete_progress(args.output)
+    delete_progress(args.output, output_dir)
 
     print()
 

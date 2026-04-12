@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 def _xml_parser():
     """Return the best available BeautifulSoup parser for XML documents."""
     try:
-        import lxml  
+        import lxml  # noqa: F401
         return "lxml-xml"
     except ImportError:
         pass
@@ -19,6 +19,8 @@ _XML_PARSER = _xml_parser()
 
 
 def _to_absolute(ref, base_url, target_domain):
+    """Convert a relative or protocol-relative URL to an absolute URL.
+    Returns None if the URL belongs to a different domain."""
     if not ref or not ref.strip():
         return None
 
@@ -39,11 +41,13 @@ def _to_absolute(ref, base_url, target_domain):
 
 
 def fetch_robots(base_url, timeout=5, headers=None):
+    """Fetch and parse robots.txt for disallowed/allowed paths and sitemap URLs."""
     result = {"paths": [], "sitemaps": []}
     robots_url = base_url.rstrip("/") + "/robots.txt"
 
     try:
-        resp = requests.get(robots_url, headers=headers, timeout=timeout, verify=False, allow_redirects=True)
+        resp = requests.get(robots_url, headers=headers, timeout=timeout,
+                            verify=False, allow_redirects=True)
         if resp.status_code != 200:
             return result
 
@@ -55,27 +59,34 @@ def fetch_robots(base_url, timeout=5, headers=None):
             if not line or line.startswith("#"):
                 continue
 
+            # Extract Disallow / Allow paths
             for directive in ("Disallow:", "Allow:"):
                 if line.lower().startswith(directive.lower()):
                     path = line[len(directive):].strip()
                     if path and path != "/":
+                        # Remove wildcards and query strings
                         path = path.split("*")[0].split("?")[0].rstrip("$")
                         if path and path.startswith("/"):
                             paths.add(path)
                     break
 
+            # FIX #1: Proper sitemap URL extraction
+            # Original code used line.split(":", 1) which breaks on "https://"
             if line.lower().startswith("sitemap:"):
-                parts = line.split(":", 1)
-                if len(parts) == 2:
-                    sitemap_url = parts[1].strip()
+                sitemap_url = line[len("Sitemap:"):].strip()
+                # Handle case-insensitive "Sitemap:" with varying cases
+                if not sitemap_url:
+                    # Try splitting after first colon that's part of directive
+                    idx = line.lower().index("sitemap:")
+                    sitemap_url = line[idx + len("sitemap:"):].strip()
 
+                if sitemap_url:
                     if sitemap_url.startswith("//"):
                         sitemap_url = "https:" + sitemap_url
                     elif sitemap_url.startswith("/"):
                         sitemap_url = base_url.rstrip("/") + sitemap_url
-                    elif not sitemap_url.startswith("http"):
-                        sitemap_url = line[len("sitemap:"):].strip()
-                    if sitemap_url:
+                    # Only add if it looks like a valid URL
+                    if sitemap_url.startswith("http"):
                         sitemaps.append(sitemap_url)
 
         result["paths"] = sorted(paths)
@@ -89,7 +100,15 @@ def fetch_robots(base_url, timeout=5, headers=None):
     return result
 
 
-def fetch_sitemap(sitemap_url, timeout=5, headers=None, visited=None, depth=0):
+def fetch_sitemap(sitemap_url, timeout=5, headers=None, visited=None, depth=0,
+                  max_paths=500, max_sitemaps=5):
+    """Recursively fetch and parse sitemap XML files for URL paths.
+
+    Args:
+        max_paths: Maximum total paths to collect (default: 500).
+                   Prevents 20,000+ path explosions from large sitemaps.
+        max_sitemaps: Maximum nested sitemaps to follow (default: 5).
+    """
     MAX_DEPTH = 5
     if depth > MAX_DEPTH:
         return []
@@ -108,19 +127,31 @@ def fetch_sitemap(sitemap_url, timeout=5, headers=None, visited=None, depth=0):
         if resp.status_code != 200:
             return []
 
-
         soup = BeautifulSoup(resp.text, _XML_PARSER)
 
+        # Handle sitemap index files (nested sitemaps) — with limit
         sitemap_tags = soup.find_all("sitemap")
         if sitemap_tags:
+            sitemaps_followed = 0
             for sm in sitemap_tags:
+                if sitemaps_followed >= max_sitemaps:
+                    break
                 loc = sm.find("loc")
                 if loc and loc.text:
-                    nested_paths = fetch_sitemap(loc.text.strip(), timeout, headers, visited, depth + 1)
+                    nested_paths = fetch_sitemap(
+                        loc.text.strip(), timeout, headers, visited, depth + 1,
+                        max_paths=max_paths - len(paths), max_sitemaps=max_sitemaps,
+                    )
                     paths.update(nested_paths)
+                    sitemaps_followed += 1
+                    if len(paths) >= max_paths:
+                        break
 
+        # Handle regular URL entries — with limit
         url_tags = soup.find_all("url")
         for url_tag in url_tags:
+            if len(paths) >= max_paths:
+                break
             loc = url_tag.find("loc")
             if loc and loc.text:
                 full_url = loc.text.strip()
@@ -138,6 +169,7 @@ def fetch_sitemap(sitemap_url, timeout=5, headers=None, visited=None, depth=0):
 
 
 def discover_js_files(base_url, timeout=5, headers=None):
+    """Discover JavaScript files from the target's homepage HTML."""
     js_files = set()
     target_domain = urlparse(base_url).netloc
 
@@ -148,6 +180,7 @@ def discover_js_files(base_url, timeout=5, headers=None):
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
+        # Find <script src="..."> tags
         for script in soup.find_all("script", src=True):
             src = script["src"].strip()
             if not src:
@@ -158,14 +191,21 @@ def discover_js_files(base_url, timeout=5, headers=None):
                 continue
 
             parsed = urlparse(abs_url)
-            if parsed.path.endswith(".js") or ".js?" in parsed.path or ".js?" in abs_url:
+            if (parsed.path.endswith(".js")
+                    or ".js?" in parsed.path
+                    or ".js?" in abs_url):
                 js_files.add(abs_url)
-            elif "/js/" in abs_url or "/javascript/" in abs_url or "bundle" in abs_url or "chunk" in abs_url:
+            elif any(kw in abs_url for kw in ("/js/", "/javascript/", "bundle", "chunk")):
                 js_files.add(abs_url)
 
+        # FIX #2: Also check template literals (backtick strings) for JS refs
         for script in soup.find_all("script"):
             if script.string:
-                inline_refs = re.findall(r'["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', script.string)
+                # Match both quoted and backtick-quoted JS file references
+                inline_refs = re.findall(
+                    r'["\'\`]([^"\'\`]+\.js(?:\?[^"\'\`]*)?)["\'\`]',
+                    script.string
+                )
                 for ref in inline_refs:
                     abs_url = _to_absolute(ref, base_url, target_domain)
                     if abs_url:

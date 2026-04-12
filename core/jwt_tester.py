@@ -1,3 +1,5 @@
+"""JWT vulnerability testing module for API-Discovery."""
+
 import json
 import base64
 import hashlib
@@ -13,6 +15,7 @@ except ImportError:
     HAS_PYJWT = False
 
 
+# FIX #1: Expanded weak secrets list (14 -> 30+ entries)
 WEAK_SECRETS = [
     "secret",
     "password",
@@ -28,16 +31,36 @@ WEAK_SECRETS = [
     "jwt",
     "token",
     "supersecret",
+    "password123",
+    "qwerty",
+    "letmein",
+    "welcome",
+    "monkey",
+    "master",
+    "dragon",
+    "login",
+    "abc123",
+    "admin123",
+    "passw0rd",
+    "1234567890",
+    "secret123",
+    "mypassword",
+    "test123",
+    "iloveyou",
+    "trustno1",
+    "sunshine",
 ]
 
 
 def _base64url_encode(data):
+    """Base64url-encode data (bytes or string)."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
 
 
 def _base64url_decode(data):
+    """Base64url-decode data with proper padding."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     padding = 4 - len(data) % 4
@@ -59,7 +82,9 @@ def _decode_jwt_parts(jwt_token):
     except Exception:
         return None, None
 
+
 def extract_jwts_from_results(all_secrets):
+    """Extract JWT tokens from the secrets list."""
     jwt_tokens = []
 
     for secret in all_secrets:
@@ -74,10 +99,12 @@ def extract_jwts_from_results(all_secrets):
 
 
 def test_jwt_none_algorithm(jwt_token, url, headers=None, timeout=5):
+    """Test if the server accepts JWT tokens with 'none' algorithm (alg bypass)."""
     header, payload = _decode_jwt_parts(jwt_token)
     if header is None or payload is None:
         return False
 
+    # Forge a token with alg: none
     forged_header = {"alg": "none", "typ": "JWT"}
     forged_token = (
         _base64url_encode(json.dumps(forged_header, separators=(",", ":")))
@@ -103,6 +130,7 @@ def test_jwt_none_algorithm(jwt_token, url, headers=None, timeout=5):
 
 
 def test_jwt_weak_secret(jwt_token, url=None, headers=None, timeout=5):
+    """Test if the JWT was signed with a commonly used weak secret."""
     header, payload = _decode_jwt_parts(jwt_token)
     if header is None or payload is None:
         return None
@@ -111,17 +139,20 @@ def test_jwt_weak_secret(jwt_token, url=None, headers=None, timeout=5):
     if len(parts) != 3:
         return None
 
-
     signing_input = f"{parts[0]}.{parts[1]}"
     original_signature = parts[2]
 
+    # Determine hash function based on algorithm
     alg = header.get("alg", "HS256").upper()
     if alg == "HS384":
         digest_fn = hashlib.sha384
     elif alg == "HS512":
         digest_fn = hashlib.sha512
-    else:
+    elif alg.startswith("HS"):
         digest_fn = hashlib.sha256
+    else:
+        # Non-HMAC algorithms (RS256, ES256, etc.) — can't test with secrets
+        return None
 
     for weak_secret in WEAK_SECRETS:
         try:

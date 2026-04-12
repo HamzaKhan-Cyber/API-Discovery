@@ -4,7 +4,6 @@ from urllib.parse import urlparse
 import requests
 
 
-
 API_PATH_PATTERNS = [
     r'["\'](/api/[^\s"\'<>{}]+)["\']',
     r'["\'](/v[0-9]+/[^\s"\'<>{}]+)["\']',
@@ -34,7 +33,9 @@ API_PATH_PATTERNS = [
     r'href\s*[=:]\s*["\'](/[^\s"\'<>{}]+)["\']',
     r'path\s*[=:]\s*["\'](/[^\s"\'<>{}]+)["\']',
     r'route\s*[=:]\s*["\'](/[^\s"\'<>{}]+)["\']',
-    r'["\'](/[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*)["\']',
+    # FIX #1: Made catch-all pattern require at least one API-like segment
+    # Old pattern matched ANY two-segment path like "/true/false" — too aggressive
+    r'["\'](/(?:api|v\d+|rest|auth|admin|user|data|service|app|resource)/[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)*)["\']',
 ]
 
 
@@ -61,7 +62,9 @@ SECRET_PATTERNS = {
     "RSA Private Key": r'(-----BEGIN(?:\sRSA|\sEC)?\sPRIVATE\sKEY-----)',
     "Generic Bearer Token": r'(?i)(?:bearer\s+)([A-Za-z0-9\-_.]+\.[A-Za-z0-9\-_.]+\.[A-Za-z0-9\-_]+)',
     "Database Connection String": r'((?:mysql|postgres|postgresql|mongodb|redis)(?:[+a-z0-9]*)://[a-zA-Z0-9_.:!?-]+@[a-zA-Z0-9_.-]+)',
-    "Internal IP Address": r'\b((?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}))\b',
+    # FIX #2: Internal IP pattern now requires context to reduce false positives
+    # e.g., must appear near keywords like "host", "url", "server", "ip", "addr"
+    "Internal IP Address": r'(?i)(?:host|url|server|ip|addr|endpoint)["\s:=]+["\']?((?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}))',
     "Generic Secret / Password": r'(?i)(?:password|passwd|pwd|secret|api[-_]?key|apikey|api_token)\s*[=:]\s*["\']([^"\']{8,64})["\']',
     "Firebase Database": r'(https://[a-z0-9-]+\.firebaseio\.com)',
     "Firebase Configuration": r'(https://[a-z0-9-]+\.firebaseapp\.com)',
@@ -69,6 +72,7 @@ SECRET_PATTERNS = {
 
 
 def extract_api_paths(js_content):
+    """Extract API endpoint paths from JavaScript content."""
     found_paths = set()
 
     for pattern in API_PATH_PATTERNS:
@@ -79,32 +83,34 @@ def extract_api_paths(js_content):
                 if not match:
                     continue
 
-
                 if match.startswith("/") or match.startswith("http"):
-
                     if match.startswith("http"):
                         parsed = urlparse(match)
                         path = parsed.path
                         if path and path != "/":
                             found_paths.add(path)
                     else:
-
                         path = match.split("?")[0].split("#")[0]
                         if path and len(path) > 1:
                             found_paths.add(path)
-        except (re.error, ValueError, Exception):
+        except Exception:
             continue
 
-
+    # Filter out false positives
     filtered = set()
     false_positives = {
         "/", "//", "/./", "/../",
         "/node_modules", "/webpack", "/src/", "/dist/",
         "/true", "/false", "/null", "/undefined",
     }
-    bad_extensions = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
-                      ".css", ".scss", ".less", ".map", ".woff", ".woff2",
-                      ".ttf", ".eot", ".mp4", ".mp3", ".pdf")
+    # FIX #3: Added .js to bad_extensions so JS file paths don't get reported as API endpoints
+    bad_extensions = (
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+        ".css", ".scss", ".less", ".map", ".woff", ".woff2",
+        ".ttf", ".eot", ".mp4", ".mp3", ".pdf",
+        ".js", ".jsx", ".ts", ".tsx", ".mjs",
+        ".html", ".htm", ".xml",
+    )
 
     for path in found_paths:
         if path in false_positives:
@@ -113,34 +119,42 @@ def extract_api_paths(js_content):
             continue
         if len(path) < 2 or len(path) > 200:
             continue
+        # FIX #4: Skip paths that look like JS module paths
+        if any(seg in path.lower() for seg in ("/node_modules/", "/__webpack", "/.next/")):
+            continue
         filtered.add(path)
 
     return sorted(filtered)
 
 
 def extract_secrets(js_content):
+    """Extract potential secrets and credentials from JavaScript content."""
     found_secrets = []
     seen_values = set()
 
     for secret_type, pattern in SECRET_PATTERNS.items():
         try:
             for match in re.finditer(pattern, js_content, re.IGNORECASE):
-
-                value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                value = (match.group(1)
+                         if match.lastindex and match.lastindex >= 1
+                         else match.group(0))
                 value = value.strip()
 
                 if not value or value in seen_values:
                     continue
 
-
-                if value.lower() in ("password", "secret", "key", "token", "api_key"):
+                # Skip generic placeholder values
+                if value.lower() in ("password", "secret", "key", "token",
+                                     "api_key", "changeme", "your_key_here",
+                                     "REPLACE_ME", "TODO", "example"):
                     continue
-                if len(value) < 4:
+                # FIX #5: Increased minimum length from 4 to 8 for less false positives
+                if len(value) < 8:
                     continue
 
                 seen_values.add(value)
 
-
+                # Extract surrounding context
                 start = max(0, match.start() - 60)
                 end = min(len(js_content), match.end() + 60)
                 context = js_content[start:end].replace("\n", " ").strip()
@@ -150,7 +164,7 @@ def extract_secrets(js_content):
                     "value": value,
                     "context": context,
                 })
-        except (re.error, ValueError, Exception):
+        except Exception:
             continue
 
     return found_secrets
@@ -168,15 +182,33 @@ def scan_js_file(js_url, timeout=5, headers=None):
     }
 
     try:
-        resp = requests.get(js_url, headers=headers, timeout=timeout, verify=False)
+        # FIX #6: Use streaming to avoid downloading huge files entirely into memory
+        resp = requests.get(js_url, headers=headers, timeout=timeout,
+                            verify=False, stream=True)
         if resp.status_code != 200:
+            resp.close()
             return result
 
-
-        if len(resp.content) > 5 * 1024 * 1024:
+        # Check Content-Length header first if available
+        content_length = resp.headers.get("Content-Length")
+        if content_length and int(content_length) > 5 * 1024 * 1024:
+            resp.close()
             return result
 
-        content = resp.content.decode("utf-8", errors="ignore")
+        # Read content with a size limit
+        chunks = []
+        total_size = 0
+        max_size = 5 * 1024 * 1024  # 5MB
+
+        for chunk in resp.iter_content(chunk_size=65536):
+            total_size += len(chunk)
+            if total_size > max_size:
+                resp.close()
+                return result
+            chunks.append(chunk)
+
+        resp.close()
+        content = b"".join(chunks).decode("utf-8", errors="ignore")
 
         result["paths"] = extract_api_paths(content)
         result["secrets"] = extract_secrets(content)
